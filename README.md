@@ -4,6 +4,52 @@
 処理本体はLean 4だけで記述しています。mathlib、FFI、外部将棋エンジンへの依存はありません。
 `lean-toolchain` は `leanprover/lean4:v4.34.0` に固定しています。
 
+## 合法手生成の形式証明
+
+`Shogi.lean` の `Shogi.Spec.LegalMove` は、生成リストへの所属ではなく、
+駒の利き・経路の空き・移動先・成り・持ち駒・二歩・行き所のない駒・
+自玉の安全・打ち歩詰めを `Prop` で定義した仕様です。
+仕様は `legalMoves`、`boardMoves`、`dropMoves` や Boolean の合法性判定関数を呼びません。
+座標、盤面参照、持ち駒数、玉の位置検索 `kingSquare`、状態遷移 `applyUnchecked` は
+実装と共有する基礎的な意味論です。
+
+次の定理を Lean のカーネルで検証します。有限個のテスト局面だけでなく、
+任意の `Position` と `Move` に対する定理です。
+
+```lean
+Shogi.legalMoves_correct (p : Shogi.Position) (m : Shogi.Move) :
+  m ∈ Shogi.legalMoves p ↔ Shogi.Spec.LegalMove p m
+
+Shogi.legalMoves_sound (p : Shogi.Position) (m : Shogi.Move) :
+  m ∈ Shogi.legalMoves p → Shogi.Spec.LegalMove p m
+
+Shogi.legalMoves_complete (p : Shogi.Position) (m : Shogi.Move) :
+  Shogi.Spec.LegalMove p m → m ∈ Shogi.legalMoves p
+```
+
+経路、各駒の利き、成り、二歩、盤上の移動と駒打ちの列挙、王手判定、
+打ち歩詰め判定の対応を補題として証明し、全体の健全性と完全性につなげています。
+`sorry`、独自の公理、`native_decide` は使っていません。
+
+```sh
+lake build
+lake env lean tests/ProofAudit.lean
+lake exe shogi-tests
+```
+
+`ProofAudit.lean` は公開定理の型と公理依存を確認します。
+依存する公理は Lean 標準の `propext`、`Classical.choice`、`Quot.sound` のみです。
+
+証明対象はこの明示的な**局面単位の仕様に対する生成の一致**です。
+打ち歩詰めの仕様では、打った歩が玉に利き、相手に自玉を安全にする盤上の応手が
+存在しないことを禁止条件としています。応手は生成器を使わず、任意の手について量化します。
+「隣接する歩の王手には駒打ちで応じられない」という幾何学的な還元はこの仕様に
+組み込んでおり、全種類の応手による別の詰み定義との同値までは証明していません。
+また、共有する状態遷移・玉の検索・SFENパーサ・局面検証の独立した仕様との一致、
+局面の到達可能性、千日手などの履歴依存ルール、USI文字列の一意性、出力の重複排除は
+この定理の対象外です。通常の将棋として解釈する入力には、従来どおり
+`parseSFEN` / `validatePosition` を使用してください。
+
 ## 実行
 
 elan / Leanがインストール済みの環境で、プロジェクトディレクトリに移動します。

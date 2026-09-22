@@ -16,7 +16,7 @@ namespace Shogi
 
 inductive Color where
   | black | white
-  deriving BEq, DecidableEq, Repr
+  deriving BEq, DecidableEq, Repr, ReflBEq, LawfulBEq
 
 def Color.other : Color -> Color
   | .black => .white
@@ -24,7 +24,7 @@ def Color.other : Color -> Color
 
 inductive Kind where
   | pawn | lance | knight | silver | gold | bishop | rook | king
-  deriving BEq, DecidableEq, Repr
+  deriving BEq, DecidableEq, Repr, ReflBEq, LawfulBEq
 
 def Kind.canPromote : Kind -> Bool
   | .gold | .king => false
@@ -57,7 +57,7 @@ structure Piece where
   color : Color
   kind : Kind
   promoted : Bool := false
-  deriving BEq, DecidableEq, Repr
+  deriving BEq, DecidableEq, Repr, ReflBEq, LawfulBEq
 
 abbrev Square := Fin 81
 abbrev Board := Vector (Option Piece) 81
@@ -118,7 +118,7 @@ structure Position where
 inductive Move where
   | normal (src dst : Square) (promote : Bool)
   | drop (kind : Kind) (dst : Square)
-  deriving BEq, DecidableEq, Repr
+  deriving BEq, DecidableEq, Repr, ReflBEq, LawfulBEq
 
 def Move.toUSI : Move -> String
   | .normal src dst promote =>
@@ -206,32 +206,30 @@ private def targetAvailable (p : Position) (dst : Square) : Bool :=
 
 /-- Board moves respecting movement, occupancy, and promotion. King safety is
 checked later. All legal non-promotions are retained, even when strategically bad. -/
-def boardMoves (p : Position) : List Move := Id.run do
-  let mut result : List Move := []
-  for src in squares do
+def boardMoves (p : Position) : List Move :=
+  squares.flatMap fun src =>
     match p.board.get src with
-    | none => pure ()
+    | none => []
     | some q =>
       if q.color == p.turn then
-        for dst in squares do
+        squares.flatMap fun dst =>
           if targetAvailable p dst && attacks p.board q src dst then
-            if q.promoted || !(deadRank q.color q.kind dst) then
-              result := Move.normal src dst false :: result
-            if !q.promoted && q.kind.canPromote &&
+            (if q.promoted || !(deadRank q.color q.kind dst) then
+              [Move.normal src dst false] else []) ++
+            (if !q.promoted && q.kind.canPromote &&
                (inZone q.color src || inZone q.color dst) then
-              result := Move.normal src dst true :: result
-  return result.reverse
+              [Move.normal src dst true] else [])
+          else []
+      else []
 
 /-- Drops before king-safety and pawn-drop-mate filtering. -/
-def dropMoves (p : Position) : List Move := Id.run do
-  let mut result : List Move := []
-  for k in handKinds do
+def dropMoves (p : Position) : List Move :=
+  handKinds.flatMap fun k =>
     if 0 < p.hands.count p.turn k then
-      for dst in squares do
-        if (p.board.get dst).isNone && !(deadRank p.turn k dst) &&
-           !(k == .pawn && hasPawnOnFile p p.turn (col dst)) then
-          result := Move.drop k dst :: result
-  return result.reverse
+      (squares.filter fun dst =>
+        (p.board.get dst).isNone && !(deadRank p.turn k dst) &&
+           !(k == .pawn && hasPawnOnFile p p.turn (col dst))).map (Move.drop k)
+    else []
 
 /-- Internal transition: caller must supply a pseudo-legal move. This is NOT a
 validation API. Captures demote the captured piece before adding it to the hand. -/
@@ -281,6 +279,251 @@ def legalMoves (p : Position) : List Move :=
   (boardMoves p ++ dropMoves p).filter fun m =>
     let next := applyUnchecked p m
     !(inCheck next p.turn) && !(pawnDropMate p.turn m next)
+
+/-! ## Declarative position-local rules
+
+The specification below never calls a move generator or a Boolean legality
+checker. Coordinates, board access, king lookup and the state transition are
+shared data semantics. In particular, pawn-drop replies are quantified moves,
+not membership in `boardMoves`. On valid positions each king lookup is unique.
+History-dependent rules are outside this specification.
+-/
+namespace Spec
+
+/-- Every strictly intermediate square of a sliding move is empty. -/
+def ClearPath (b : Board) (src dst : Square) : Prop :=
+  let dr : Int := (row dst : Int) - (row src : Int)
+  let dc : Int := (col dst : Int) - (col src : Int)
+  ∀ i : Nat, 0 < i → i < max dr.natAbs dc.natAbs →
+    ∃ s, squareAt ((row src : Int) + sign dr * (i : Int))
+                  ((col src : Int) + sign dc * (i : Int)) = some s ∧ b.get s = none
+
+def Attacks (b : Board) (p : Piece) (src dst : Square) : Prop :=
+  let dr : Int := (row dst : Int) - (row src : Int)
+  let dc : Int := (col dst : Int) - (col src : Int)
+  let forward : Int := if p.color = .black then -dr else dr
+  let a := dc.natAbs
+  let kingStep := a ≤ 1 ∧ dr.natAbs ≤ 1
+  let goldStep := (forward = 1 ∧ a ≤ 1) ∨
+    (forward = 0 ∧ a = 1) ∨ (forward = -1 ∧ dc = 0)
+  src ≠ dst ∧ match p.kind with
+  | .pawn => if p.promoted then goldStep else dc = 0 ∧ forward = 1
+  | .lance => if p.promoted then goldStep
+             else dc = 0 ∧ 0 < forward ∧ ClearPath b src dst
+  | .knight => if p.promoted then goldStep else a = 1 ∧ forward = 2
+  | .silver => if p.promoted then goldStep
+              else (forward = 1 ∧ a ≤ 1) ∨ (forward = -1 ∧ a = 1)
+  | .gold => goldStep
+  | .bishop => (a = dr.natAbs ∧ ClearPath b src dst) ∨
+                (p.promoted = true ∧ kingStep)
+  | .rook => ((dc = 0 ∨ dr = 0) ∧ ClearPath b src dst) ∨
+                (p.promoted = true ∧ kingStep)
+  | .king => kingStep
+
+def InZone (c : Color) (s : Square) : Prop :=
+  if c = .black then row s ≤ 2 else 6 ≤ row s
+
+def DeadRank (c : Color) (k : Kind) (s : Square) : Prop :=
+  let distance := if c = .black then row s else 8 - row s
+  match k with
+  | .pawn | .lance => distance = 0
+  | .knight => distance ≤ 1
+  | _ => False
+
+def HasPawnOnFile (p : Position) (c : Color) (file : Nat) : Prop :=
+  ∃ s q, col s = file ∧ p.board.get s = some q ∧
+    q.color = c ∧ q.kind = .pawn ∧ q.promoted = false
+
+def TargetAvailable (p : Position) (dst : Square) : Prop :=
+  ∀ q, p.board.get dst = some q → q.color ≠ p.turn ∧ q.kind ≠ .king
+
+def PromotionAllowed (q : Piece) (src dst : Square) (promote : Bool) : Prop :=
+  if promote then
+    q.promoted = false ∧ q.kind ≠ .gold ∧ q.kind ≠ .king ∧
+      (InZone q.color src ∨ InZone q.color dst)
+  else q.promoted = true ∨ ¬DeadRank q.color q.kind dst
+
+def BoardMove (p : Position) : Move → Prop
+  | .normal src dst promote =>
+    ∃ q, p.board.get src = some q ∧ q.color = p.turn ∧
+      TargetAvailable p dst ∧ Attacks p.board q src dst ∧
+      PromotionAllowed q src dst promote
+  | .drop .. => False
+
+def DropMove (p : Position) : Move → Prop
+  | .drop k dst => k ≠ .king ∧ 0 < p.hands.count p.turn k ∧
+    p.board.get dst = none ∧ ¬DeadRank p.turn k dst ∧
+    ¬(k = .pawn ∧ HasPawnOnFile p p.turn (col dst))
+  | .normal .. => False
+
+/-- A missing king is unsafe, matching the public API's defensive convention. -/
+def KingSafe (p : Position) (c : Color) : Prop :=
+  ∃ king, kingSquare p c = some king ∧
+    ∀ src q, p.board.get src = some q → q.color ≠ c →
+      ¬Attacks p.board q src king
+
+def PawnDropMate (mover : Color) (m : Move) (next : Position) : Prop :=
+  match m with
+  | .drop .pawn dst =>
+    (∃ king, kingSquare next mover.other = some king ∧
+      Attacks next.board { color := mover, kind := .pawn } dst king) ∧
+    ¬∃ reply, BoardMove next reply ∧ KingSafe (applyUnchecked next reply) next.turn
+  | _ => False
+
+/-- Legal under the position-local rules, including the adjacent pawn check
+evasion rule. This is independent of enumeration and Boolean rule checkers. -/
+def LegalMove (p : Position) (m : Move) : Prop :=
+  (BoardMove p m ∨ DropMove p m) ∧
+  KingSafe (applyUnchecked p m) p.turn ∧
+  ¬PawnDropMate p.turn m (applyUnchecked p m)
+
+end Spec
+
+/-! ## Reflection and exhaustive-enumeration proofs -/
+
+@[simp] theorem mem_squares (s : Square) : s ∈ squares := List.mem_finRange s
+
+theorem clearPath_correct (b : Board) (src dst : Square) :
+    clearPath b src dst = true ↔ Spec.ClearPath b src dst := by
+  simp only [clearPath, Spec.ClearPath, List.all_eq_true]
+  have range_mem (n i : Nat) : i ∈ (List.range n).drop 1 ↔ 0 < i ∧ i < n := by
+    simp only [List.range_eq_range', List.drop_range', List.mem_range'_1]
+    omega
+  simp only [range_mem, and_imp]
+  apply forall_congr'; intro i
+  apply forall_congr'; intro _
+  apply forall_congr'; intro _
+  split <;> simp_all
+
+theorem attacks_correct (b : Board) (q : Piece) (src dst : Square) :
+    attacks b q src dst = true ↔ Spec.Attacks b q src dst := by
+  cases q with | mk c k promoted =>
+    cases c <;> cases k <;> cases promoted <;>
+      simp [attacks, Spec.Attacks, clearPath_correct, and_assoc, or_assoc]
+
+theorem deadRank_correct (c : Color) (k : Kind) (s : Square) :
+    deadRank c k s = true ↔ Spec.DeadRank c k s := by
+  cases c <;> cases k <;> simp [deadRank, Spec.DeadRank]
+
+theorem inZone_correct (c : Color) (s : Square) :
+    inZone c s = true ↔ Spec.InZone c s := by
+  cases c <;> simp [inZone, Spec.InZone]
+
+theorem hasPawnOnFile_correct (p : Position) (c : Color) (file : Nat) :
+    hasPawnOnFile p c file = true ↔ Spec.HasPawnOnFile p c file := by
+  simp only [hasPawnOnFile, List.any_eq_true, mem_squares, true_and,
+    Bool.and_eq_true, beq_iff_eq, Spec.HasPawnOnFile]
+  apply exists_congr; intro s
+  cases h : p.board.get s <;> simp [and_assoc]
+
+theorem targetAvailable_correct (p : Position) (dst : Square) :
+    targetAvailable p dst = true ↔ Spec.TargetAvailable p dst := by
+  cases h : p.board.get dst <;> simp [targetAvailable, Spec.TargetAvailable, h]
+
+theorem promotion_correct (q : Piece) (src dst : Square) :
+    (!q.promoted && q.kind.canPromote && (inZone q.color src || inZone q.color dst)) = true ↔
+      Spec.PromotionAllowed q src dst true := by
+  cases hk : q.kind <;>
+    simp [Kind.canPromote, Spec.PromotionAllowed, inZone_correct, hk]
+
+theorem deadRank_false (c : Color) (k : Kind) (s : Square) :
+    deadRank c k s = false ↔ ¬Spec.DeadRank c k s := by
+  rw [Bool.eq_false_iff, ne_eq, deadRank_correct]
+
+theorem hasPawnOnFile_false (p : Position) (c : Color) (file : Nat) :
+    hasPawnOnFile p c file = false ↔ ¬Spec.HasPawnOnFile p c file := by
+  rw [Bool.eq_false_iff, ne_eq, hasPawnOnFile_correct]
+
+theorem nonpromotion_correct (q : Piece) (src dst : Square) :
+    (q.promoted || !deadRank q.color q.kind dst) = true ↔
+      Spec.PromotionAllowed q src dst false := by
+  simp [Spec.PromotionAllowed, deadRank_false]
+
+theorem boardMoves_correct (p : Position) (m : Move) :
+    m ∈ boardMoves p ↔ Spec.BoardMove p m := by
+  simp only [boardMoves, List.mem_flatMap, mem_squares, true_and]
+  have source (src : Square) :
+      (m ∈ (match p.board.get src with
+        | none => []
+        | some q => if q.color == p.turn then
+            squares.flatMap (fun dst =>
+              if targetAvailable p dst && attacks p.board q src dst then
+                (if q.promoted || !deadRank q.color q.kind dst then
+                  [Move.normal src dst false] else []) ++
+                (if !q.promoted && q.kind.canPromote &&
+                  (inZone q.color src || inZone q.color dst) then
+                  [Move.normal src dst true] else [])
+              else [])
+          else [])) ↔
+      ∃ q dst promote, p.board.get src = some q ∧ q.color = p.turn ∧
+        Spec.TargetAvailable p dst ∧ Spec.Attacks p.board q src dst ∧
+        Spec.PromotionAllowed q src dst promote ∧ m = .normal src dst promote := by
+    cases h : p.board.get src with
+    | none => simp
+    | some q =>
+      simp only [Option.some.injEq]
+      by_cases hc : q.color = p.turn
+      · have hc' : (q.color == p.turn) = true := by simpa using hc
+        rw [ite_eq_left hc']
+        simp only [List.mem_flatMap, mem_squares, true_and, List.mem_ite_nil_right,
+          List.mem_append, List.mem_singleton, promotion_correct]
+        simp only [Bool.and_eq_true, targetAvailable_correct, attacks_correct,
+          Bool.exists_bool]
+        simp [Spec.PromotionAllowed, deadRank_false]
+        grind
+      · simp [hc]
+  simp only [source]
+  cases m <;> simp [Spec.BoardMove] <;> grind
+
+theorem dropMoves_correct (p : Position) (m : Move) :
+    m ∈ dropMoves p ↔ Spec.DropMove p m := by
+  have kinds (k : Kind) : k ∈ handKinds ↔ k ≠ .king := by
+    cases k <;> simp [handKinds]
+  simp only [dropMoves, List.mem_flatMap]
+  simp [List.mem_map, List.mem_filter, kinds,
+    deadRank_false, hasPawnOnFile_false]
+  cases m <;> simp [Spec.DropMove] <;> grind
+
+theorem kingSafe_correct (p : Position) (c : Color) :
+    inCheck p c = false ↔ Spec.KingSafe p c := by
+  unfold inCheck Spec.KingSafe
+  cases hk : kingSquare p c with
+  | none => simp
+  | some king =>
+    simp only [Option.some.injEq, List.any_eq_false, mem_squares, true_implies]
+    simp only [exists_eq_left']
+    apply forall_congr'; intro src
+    cases hs : p.board.get src <;> simp [attacks_correct]
+
+theorem pawnDropMate_correct (mover : Color) (m : Move) (next : Position) :
+    pawnDropMate mover m next = true ↔ Spec.PawnDropMate mover m next := by
+  have replies : (boardMoves next).any (kingSafeAfter next) = true ↔
+      ∃ reply, Spec.BoardMove next reply ∧
+        Spec.KingSafe (applyUnchecked next reply) next.turn := by
+    simp [List.any_eq_true, boardMoves_correct, kingSafeAfter, kingSafe_correct]
+  cases m with
+  | normal src dst promote => simp [pawnDropMate, Spec.PawnDropMate]
+  | drop k dst =>
+    cases k <;> simp [pawnDropMate, Spec.PawnDropMate]
+    cases hk : kingSquare next mover.other <;>
+      simp [attacks_correct, Bool.eq_false_iff, replies]
+
+/-- Soundness and completeness of the actual public generator. -/
+theorem legalMoves_correct (p : Position) (m : Move) :
+    m ∈ legalMoves p ↔ Spec.LegalMove p m := by
+  have mate_false : pawnDropMate p.turn m (applyUnchecked p m) = false ↔
+      ¬Spec.PawnDropMate p.turn m (applyUnchecked p m) := by
+    rw [Bool.eq_false_iff, ne_eq, pawnDropMate_correct]
+  simp [legalMoves, List.mem_filter, List.mem_append, boardMoves_correct,
+    dropMoves_correct, kingSafe_correct, mate_false, Spec.LegalMove, or_and_right]
+
+/-- Every generated move satisfies the independent rules. -/
+theorem legalMoves_sound (p : Position) (m : Move) :
+    m ∈ legalMoves p → Spec.LegalMove p m := (legalMoves_correct p m).mp
+
+/-- Every move satisfying the independent rules is generated. -/
+theorem legalMoves_complete (p : Position) (m : Move) :
+    Spec.LegalMove p m → m ∈ legalMoves p := (legalMoves_correct p m).mpr
 
 /-- Checked application for moves from external callers. -/
 def play (p : Position) (m : Move) : Except String Position :=
