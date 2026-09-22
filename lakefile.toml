@@ -1,0 +1,14 @@
+name = "lean-shogi"
+version = "0.1.0"
+defaultTargets = ["shogi"]
+
+[[lean_lib]]
+name = "Shogi"
+
+[[lean_exe]]
+name = "shogi"
+root = "Main"
+
+[[lean_exe]]
+name = "shogi-tests"
+root = "Tests"

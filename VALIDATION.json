@@ -1,0 +1,13 @@
+{
+  "lean_toolchain_target": "leanprover/lean4:v4.34.0",
+  "lean_compilation": "NOT RUN: compiler unavailable; distribution download failed",
+  "lean_execution": "NOT RUN",
+  "formal_soundness_and_completeness_proof": "NOT PROVIDED",
+  "external_cshogi_comparison": "NOT RUN",
+  "python_fixture_sanity_check": "PASS: 72 fixtures and initial perft(1)=30, perft(2)=900",
+  "invalid_sfen_fixtures_prepared": 35,
+  "invalid_sfen_lean_tests": "NOT RUN",
+  "python_scripts_syntax_check": "PASS",
+  "toml_syntax_check": "PASS",
+  "lean_core_source_lines": 492
+}
